@@ -162,9 +162,9 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
         resources: ['catalog', 'meta', 'stream'],
-        types: ['Live TV', 'XT-Movies', 'XT-Series', 'series'],
+        types: ['Live TV', 'XT-Movies', 'XT-Series', 'series', 'movie'],
         catalogs,
-        idPrefixes: ['xtremio_live_', 'xtremio_movie_', 'xtremio_series_', 'xtremio_episode_'],
+        idPrefixes: ['xtremio_live_', 'xtremio_movie_', 'xtremio_series_', 'xtremio_episode_', 'tt'],
         behaviorHints: {
             configurable: true,
             configurationRequired: !cfg
@@ -237,6 +237,79 @@ function pickBackdrop(value) {
     if (!value) return undefined;
     if (Array.isArray(value)) return value[0] || undefined;
     return String(value) || undefined;
+}
+
+// --- IMDb -> Xtream matching (voor de standaard Cinemeta movie/series catalogs) ---
+
+const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
+const TMDB_BASE = 'https://api.themoviedb.org/3';
+
+const imdbCache = new Map();
+
+async function imdbToTmdb(imdbId, kind) {
+    // kind: 'movie' | 'series'
+    const cacheKey = `${kind}:${imdbId}`;
+    const cached = imdbCache.get(cacheKey);
+    if (cached && cached.ts > Date.now() - CACHE_TTL) return cached;
+
+    if (!TMDB_API_KEY) throw new Error('TMDB_API_KEY is not configured');
+
+    const url = `${TMDB_BASE}/find/${imdbId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`TMDB find failed: HTTP ${res.status}`);
+    const data = await res.json();
+    const results = kind === 'movie' ? data.movie_results : data.tv_results;
+    if (!results || !results.length) throw new Error(`No TMDB match for ${imdbId}`);
+
+    const r = results[0];
+    const entry = {
+        tmdbId: r.id,
+        title: kind === 'movie' ? r.title : r.name,
+        year: ((kind === 'movie' ? r.release_date : r.first_air_date) || '').slice(0, 4),
+        ts: Date.now()
+    };
+    imdbCache.set(cacheKey, entry);
+    return entry;
+}
+
+function normalizeTitle(s) {
+    return String(s || '')
+        .toLowerCase()
+        .replace(/┃[^┃]*┃/g, ' ')
+        .replace(/\[[^\]]*\]/g, ' ')
+        .replace(/\([^)]*\)/g, ' ')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+}
+
+async function findXtremeMovieByTmdb(cfg, tmdbId, title, year) {
+    const items = await getAllVodStreams(cfg);
+    let match = items.find(it => String(it.tmdb ?? it.tmdb_id ?? '') === String(tmdbId));
+    if (match) return match;
+
+    const normTarget = normalizeTitle(title);
+    let candidates = items.filter(it => {
+        const n = normalizeTitle(it.name);
+        return n.includes(normTarget) || normTarget.includes(n);
+    });
+    if (year) {
+        const withYear = candidates.filter(it => String(it.name).includes(year));
+        if (withYear.length) candidates = withYear;
+    }
+    return candidates[0] || null;
+}
+
+async function findXtremeSeriesByTmdb(cfg, tmdbId, title) {
+    const items = await getAllSeriesStreams(cfg);
+    let match = items.find(it => String(it.tmdb ?? '') === String(tmdbId));
+    if (match) return match;
+
+    const normTarget = normalizeTitle(title);
+    const candidates = items.filter(it => {
+        const n = normalizeTitle(it.name);
+        return n.includes(normTarget) || normTarget.includes(n);
+    });
+    return candidates[0] || null;
 }
 
 // All in-memory caches share the same TTL.
@@ -1002,6 +1075,51 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                     }
                 ]
             });
+        }
+
+        // --- Standaard IMDb-ID's (Cinemeta / normale movie & series catalogs) ---
+        if (/^tt\d+/.test(id)) {
+            const [imdbId, seasonStr, episodeStr] = id.split(':');
+
+            if (type === 'movie') {
+                const { tmdbId, title, year } = await imdbToTmdb(imdbId, 'movie');
+                const found = await findXtremeMovieByTmdb(cfg, tmdbId, title, year);
+                if (!found) return res.json({ streams: [] });
+
+                const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${found.stream_id}`);
+                const ext = info?.movie_data?.container_extension || 'mp4';
+                const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${found.stream_id}.${ext}`;
+                return res.json({
+                    streams: [{
+                        url: proxyUrl,
+                        title: '▶ Play',
+                        behaviorHints: { notWebReady: isNotWebReady(proxyUrl, ext), bingeGroup: `xtremio-movie-${ext}` }
+                    }]
+                });
+            }
+
+            if (type === 'series') {
+                const season = parseInt(seasonStr);
+                const episodeNum = parseInt(episodeStr);
+                const { tmdbId, title } = await imdbToTmdb(imdbId, 'series');
+                const found = await findXtremeSeriesByTmdb(cfg, tmdbId, title);
+                if (!found) return res.json({ streams: [] });
+
+                const seriesInfo = await getSeriesInfo(cfg, found.series_id);
+                const eps = seriesInfo?.episodes?.[String(season)] || [];
+                const ep = eps.find(e => parseInt(e.episode_num) === episodeNum);
+                if (!ep) return res.json({ streams: [] });
+
+                const ext = ep.container_extension || 'mp4';
+                const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/series/${ep.id}.${ext}`;
+                return res.json({
+                    streams: [{
+                        url: proxyUrl,
+                        title: '▶ Play',
+                        behaviorHints: { notWebReady: isNotWebReady(proxyUrl, ext), bingeGroup: `xtremio-series-${found.series_id}-${ext}` }
+                    }]
+                });
+            }
         }
 
         res.json({ streams: [] });
